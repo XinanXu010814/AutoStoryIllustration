@@ -5,8 +5,8 @@ from PIL.Image import Resampling
 from controlnet_aux import *
 from PIL import Image, ImageOps
 from controlnet_aux.open_pose import PoseResult, Keypoint
-from diffusers import StableDiffusionPipeline, AutoencoderKL, ControlNetModel, StableDiffusionControlNetPipeline, \
-    LCMScheduler, UniPCMultistepScheduler, StableDiffusionInpaintPipeline
+from diffusers import StableDiffusionPipeline,  ControlNetModel, StableDiffusionControlNetPipeline, \
+    LCMScheduler, StableDiffusionInpaintPipeline
 import torch
 import os.path as path
 import numpy as np
@@ -16,6 +16,8 @@ from BackgroundGenerator import mask_outside_bounding_box, find_bounding_box, me
 from TokenExtracter import *
 from test import denormalize, pt_to_numpy, numpy_to_pil
 from OpenposeAdapter import face_correction, scale_up_openpose, scale_down_character, face_blend, openpose_paint
+import argparse
+
 
 
 def iterate_neighbor(depth_map, width, height):
@@ -48,8 +50,9 @@ def remap(latents_origin, latents_out, depth_maps):
         outputs.append(out)
     return outputs
 
-
-def run_latent_method(main_prompt, sub_dir, pose):
+# background replacement by latent blending method
+# not used anymore, but it introduces a novel approach for background replacement
+def run_latent_method(main_prompt, sub_dir, pose, seed):
     full_dir = path.join("outputs", sub_dir)
 
     if not path.exists(full_dir):
@@ -63,7 +66,7 @@ def run_latent_method(main_prompt, sub_dir, pose):
 
     preprocessor1 = MidasDetector.from_pretrained("lllyasviel/Annotators")
 
-    generator = torch.manual_seed(128)
+    generator = torch.manual_seed(seed)
 
     pipe = StableDiffusionPipeline.from_pretrained("Lykon/dreamshaper-7", torch_dtype=torch.float16).to("cuda")
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
@@ -157,7 +160,7 @@ def run_latent_method(main_prompt, sub_dir, pose):
     ] if pose \
         else [Image.open(path.join(full_dir, 'combined_depth.png'))]
 
-    generator = torch.manual_seed(128)
+    generator = torch.manual_seed(seed)
 
     pipe = StableDiffusionControlNetPipeline.from_pretrained("Lykon/dreamshaper-7", controlnet=controlnet,
                                                              torch_dtype=torch.float16).to("cuda")
@@ -228,11 +231,11 @@ def run_latent_method(main_prompt, sub_dir, pose):
     return combined_image
 
 
-cur_sub_dir = ""
-cur_img_count = 0
-
-
-def run(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool):
+# The first version of the implementation
+# less operations in openpose correction, so it takes executing time
+# but may result in poor quality sometimes
+# specify "v1" as main argument to use this method
+def run(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, seed: int):
     full_dir = path.join("outputs", sub_dir)
 
     if not path.exists(full_dir):
@@ -255,7 +258,7 @@ def run(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool):
     else:
         preprocessor = MidasDetector.from_pretrained("lllyasviel/Annotators")
 
-    generator = torch.manual_seed(128)
+    generator = torch.manual_seed(seed)
 
     scene_prompts = scene_prompt.split("\n")
 
@@ -293,7 +296,7 @@ def run(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool):
     controlnet = [ControlNetModel.from_pretrained('lllyasviel/control_v11p_sd15_openpose', torch_dtype=torch.float16)] \
         if human else [
         ControlNetModel.from_pretrained('lllyasviel/control_v11f1p_sd15_depth', torch_dtype=torch.float16)]
-    generator = torch.manual_seed(128)
+    generator = torch.manual_seed(seed)
     pipe = StableDiffusionControlNetPipeline.from_pretrained("Lykon/dreamshaper-7", controlnet=controlnet,
                                                              torch_dtype=torch.float16).to("cuda")
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
@@ -390,7 +393,7 @@ def run(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool):
 
 
 def run_v2(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, face_length: float, face_width: float,
-           eyebrow_height: float, eye_height: float, nose_size: float, mouth_size: float):
+           eyebrow_height: float, eye_height: float, nose_size: float, mouth_size: float, seed: int):
     full_dir = path.join("outputs", sub_dir)
 
     if not path.exists(full_dir):
@@ -413,7 +416,7 @@ def run_v2(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, 
     else:
         preprocessor = MidasDetector.from_pretrained("lllyasviel/Annotators")
 
-    generator = torch.manual_seed(128)
+    generator = torch.manual_seed(seed)
 
     scene_prompts = scene_prompt.split("\n")
 
@@ -444,14 +447,21 @@ def run_v2(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, 
         image.save(path.join(full_dir, f"origin_{i}.png"))
         if human:
             result_points, face_points \
-                = face_correction(image, path.join(full_dir, f"openpose_{i}.png"), preprocessor, points_only=True)
+                = face_correction(image, path.join(full_dir, f"openpose_{i}.png"), preprocessor, points_only=True,
+                                  face_length=face_length, face_width=face_width, nose_size=nose_size,
+                                  mouth_size=mouth_size, eyebrow_height=eyebrow_height, eye_height=eye_height)
             face = [Keypoint(p[0], p[1]) for p in face_points] if face_points is not None else result_points[0].face
-            scale, min_x, min_y \
-                = scale_up_openpose([PoseResult(result_points[0].body,
-                                                result_points[0].left_hand,
-                                                result_points[0].right_hand,
-                                                face)],
-                                    2, path.join(full_dir, f"openpose_{i}.png"))
+            if face is None:
+                scale = -1
+                min_x = -1  # not used
+                min_y = -1  # not used
+            else:
+                scale, min_x, min_y \
+                    = scale_up_openpose([PoseResult(result_points[0].body,
+                                                    result_points[0].left_hand,
+                                                    result_points[0].right_hand,
+                                                    face)],
+                                        2, path.join(full_dir, f"openpose_{i}.png"))
             if scale == -1:
                 openpose_paint(result_points, path.join(full_dir, f"openpose_{i}.png"))
             scale_info.append((scale, min_x, min_y))
@@ -462,7 +472,7 @@ def run_v2(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, 
     controlnet = [ControlNetModel.from_pretrained('lllyasviel/control_v11p_sd15_openpose', torch_dtype=torch.float16)] \
         if human else [
         ControlNetModel.from_pretrained('lllyasviel/control_v11f1p_sd15_depth', torch_dtype=torch.float16)]
-    generator = torch.manual_seed(128)
+    generator = torch.manual_seed(seed)
     pipe = StableDiffusionControlNetPipeline.from_pretrained("Lykon/dreamshaper-7", controlnet=controlnet,
                                                              torch_dtype=torch.float16).to("cuda")
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
@@ -558,7 +568,7 @@ def run_v2(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, 
         # image and mask_image should be PIL images.
         # The mask structure is white for inpainting and black for keeping as is
         image_out = pipe(prompt=prompts[i], image=image_merged, mask_image=mask_image, generator=generator).images[0]
-        if human:
+        if human and scale_info[i][0] != -1:
             face_blend(image_src=image_merged, image_out=image_out, preprocessor=preprocessor)
 
         image_out.save(path.join(full_dir, f"output_{i}.png"))
@@ -569,51 +579,65 @@ def run_v2(character_prompt: str, scene_prompt: str, sub_dir: str, human: bool, 
         file.write(str(prompt_num))
     return outputs
 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Execute different methods based on the main argument")
 
-# demo = gr.Interface(
-#     fn=run_v2,
-#     # inputs=["text", "checkbox", gr.Slider(0, 100)],
-#     inputs=[
-#         "text",
-#         gr.Textbox(lines=10, placeholder="hhh..."),
-#         "text",
-#         "checkbox",
-#     ],
-#     outputs=gr.Gallery(label="Generated Images")  # ["image"]
-# )
-# demo.launch()
+    parser.add_argument('version', choices=['v1', 'v2'], nargs='?', default='v2', help="The method to execute (default: c)")
 
-with gr.Blocks() as demo:
-    with gr.Row():
-        with gr.Column(scale=2):
+    args = parser.parse_args()
+
+    if args.version == 'v1':
+        print("v1")
+        demo = gr.Interface(
+            fn=run,
+            inputs=[
+                "text",
+                gr.Textbox(lines=10, placeholder="running in forest \njumping "
+                                                 "in park \nstand in swimming "
+                                                 "pool"),
+                "text",
+                "checkbox",
+                gr.Number(label="Seed", value=128, precision=0),
+            ],
+            outputs=gr.Gallery(label="Generated Images")
+        )
+        demo.launch()
+    elif args.version == 'v2':
+        print("v2")
+        with gr.Blocks() as demo:
             with gr.Row():
-                input_text1 = gr.Textbox(label="Character Prompt", placeholder="a strong man with red T-shirt")
-            with gr.Row():
-                input_text2 = gr.Textbox(label="Scene Prompts", lines=10, placeholder="running in forest \njumping "
-                                                                                      "in park \nstand in swimming "
-                                                                                      "pool")
-            with gr.Row():
-                input_text3 = gr.Textbox(label="Image Save Directory")
-            with gr.Row():
-                input_checkbox = gr.Checkbox(label="Human Character")
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        input_text1 = gr.Textbox(label="Character Prompt", placeholder="a strong man with red T-shirt")
+                    with gr.Row():
+                        input_text2 = gr.Textbox(label="Scene Prompts", lines=10, placeholder="running in forest \njumping "
+                                                                                              "in park \nstand in swimming "
+                                                                                              "pool")
+                    with gr.Row():
+                        input_text3 = gr.Textbox(label="Image Save Directory")
+                    with gr.Row():
+                        input_checkbox = gr.Checkbox(label="Human Character", value=True)
+                    with gr.Row():
+                        input_seed = gr.Number(label="Seed", value=128, precision=0)
 
-            with gr.Accordion("Optional Settings", open=False):
-                slider1 = gr.Slider(label="Face Length", minimum=0.25, maximum=1, step=0.01, value=0.5)
-                slider2 = gr.Slider(label="Face Width", minimum=0.25, maximum=1, step=0.01, value=0.5)
-                slider3 = gr.Slider(label="Eyebrow Height", minimum=0.25, maximum=1, step=0.01, value=0.5)
-                slider4 = gr.Slider(label="Eye Height", minimum=0.25, maximum=1, step=0.01, value=0.5)
-                slider5 = gr.Slider(label="Nose Size", minimum=0.25, maximum=1, step=0.01, value=0.5)
-                slider6 = gr.Slider(label="Mouth Size", minimum=0.25, maximum=1, step=0.01, value=0.5)
+                    with gr.Accordion("Optional Settings", open=False):
+                        slider1 = gr.Slider(label="Face Length", minimum=0.25, maximum=1, step=0.01, value=0.5)
+                        slider2 = gr.Slider(label="Face Width", minimum=0.25, maximum=1, step=0.01, value=0.5)
+                        slider3 = gr.Slider(label="Eyebrow Height", minimum=0.25, maximum=1, step=0.01, value=0.5)
+                        slider4 = gr.Slider(label="Eye Height", minimum=0.25, maximum=1, step=0.01, value=0.5)
+                        slider5 = gr.Slider(label="Nose Size", minimum=0.25, maximum=1, step=0.01, value=0.5)
+                        slider6 = gr.Slider(label="Mouth Size", minimum=0.25, maximum=1, step=0.01, value=0.5)
 
-            submit_button = gr.Button("Submit")
+                    submit_button = gr.Button("Submit")
 
-        with gr.Column(scale=2):
-            output_gallery = gr.Gallery(label="Generated Images")
+                with gr.Column(scale=2):
+                    output_gallery = gr.Gallery(label="Generated Images")
 
-    submit_button.click(
-        run_v2,
-        inputs=[input_text1, input_text2, input_text3, input_checkbox, slider1, slider2, slider3, slider4],
-        outputs=output_gallery
-    )
+            submit_button.click(
+                run_v2,
+                inputs=[input_text1, input_text2, input_text3, input_checkbox, slider1, slider2,
+                        slider3, slider4, slider5, slider6, input_seed],
+                outputs=output_gallery
+            )
 
-demo.launch()
+        demo.launch()

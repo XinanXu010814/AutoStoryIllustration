@@ -175,6 +175,8 @@ def face_blend(image_src: Image, image_out: Image, preprocessor, std_factor: flo
     pixels_src = image_src.load()
 
     face_points = preprocessor.detect_poses(np.array(image_src), include_face=True, include_hand=False)[0].face
+    if face_points is None:
+        return image_out
     face_x = np.array([point.x for point in face_points])
     face_y = np.array([point.y for point in face_points])
     mean_x = np.mean(face_x)
@@ -210,6 +212,10 @@ def face_correction(input_image: Image, save_path: str, preprocessor, points_onl
 
     # face scale
     face_origin = results[0].face
+    if face_origin is None:
+        print("Openpose Detection Failed .. ")
+        return results, None
+
     face_x = [point.x for point in face_origin]
     scale_x = max(face_x) - min(face_x)
     face_y = [point.y for point in face_origin]
@@ -217,6 +223,10 @@ def face_correction(input_image: Image, save_path: str, preprocessor, points_onl
     scale_origin = max(scale_x, scale_y)
 
     body = results[0].body
+    if body is None:
+        print("Openpose Detection Failed .. ")
+        return results, None
+
     nose = body.keypoints[0]
     if nose is None:
         print("Openpose Detection Failed .. ")
